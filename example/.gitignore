@@ -1,0 +1,10 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/
+*.xcodeproj
+
+# Local values for the example (API key, server secret, local server): see Config.swift
+AbrovaSyncExample/Local.plist

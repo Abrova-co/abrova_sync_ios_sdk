@@ -1,0 +1,701 @@
+import Foundation
+import Combine
+
+/// Implementation of SyncCollection protocol
+internal class SyncCollectionImpl: SyncCollection {
+    let id: String
+    let name: String
+    let databaseId: String
+    private let apiClient: ApiClient
+    private let mqttManager: MqttManager
+    private let localStorageManager: LocalStorageManager?
+    private let syncEngine: SyncEngine?
+
+    private var isOfflineEnabled: Bool {
+        return localStorageManager != nil && syncEngine != nil
+    }
+
+    init(
+        id: String,
+        name: String,
+        databaseId: String,
+        apiClient: ApiClient,
+        mqttManager: MqttManager,
+        localStorageManager: LocalStorageManager? = nil,
+        syncEngine: SyncEngine? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.databaseId = databaseId
+        self.apiClient = apiClient
+        self.mqttManager = mqttManager
+        self.localStorageManager = localStorageManager
+        self.syncEngine = syncEngine
+    }
+
+    // MARK: - CRUD Operations
+
+    func add(data: [String: Any]) async throws -> SyncDocument {
+        if isOfflineEnabled {
+            return try await addWithOfflineSupport(data: data)
+        }
+        return try await apiClient.addDocument(databaseId: databaseId, collectionId: id, data: data)
+    }
+
+    private func addWithOfflineSupport(data: [String: Any]) async throws -> SyncDocument {
+        // Write to the server unless the connection has reported offline - like reads. Before the first report
+        // (connect() not called yet, or still connecting) `isOnline` is false, which queued every write.
+        let isOnline = syncEngine?.isKnownOffline != true
+        AbrovaSyncLogger.d("addWithOfflineSupport: isOnline=\(isOnline), databaseId=\(databaseId), collectionId=\(id)")
+
+        if isOnline {
+            // Online: Try server first
+            do {
+                AbrovaSyncLogger.d("addWithOfflineSupport: Attempting API call to add document")
+                let doc = try await apiClient.addDocument(databaseId: databaseId, collectionId: id, data: data)
+                AbrovaSyncLogger.d("addWithOfflineSupport: API call succeeded, doc.id=\(doc.id)")
+                // Cache the result
+                localStorageManager?.saveDocument(
+                    document: doc,
+                    databaseId: databaseId,
+                    collectionId: id,
+                    syncStatus: .synced
+                )
+                return doc
+            } catch {
+                // The server's final answer (the rules refused it, invalid data) is the app's to see, never queued.
+                guard SyncErrors.isTransient(error) else { throw error }
+                AbrovaSyncLogger.e("addWithOfflineSupport: \(error.localizedDescription), saving offline", error: error)
+                return createOfflineDocument(data: data)
+            }
+        } else {
+            AbrovaSyncLogger.d("addWithOfflineSupport: Device is offline, creating local document")
+            // Offline: Create optimistic document
+            return createOfflineDocument(data: data)
+        }
+    }
+
+    private func createOfflineDocument(data: [String: Any]) -> SyncDocument {
+        let tempId = "local_\(UUID().uuidString)"
+        let now = Date().timeIntervalSince1970 * 1000
+        let doc = SyncDocument(
+            id: tempId,
+            data: data,
+            createdAt: now,
+            updatedAt: now,
+            version: 1
+        )
+
+        localStorageManager?.saveDocument(
+            document: doc,
+            databaseId: databaseId,
+            collectionId: id,
+            syncStatus: .pendingCreate
+        )
+
+        AbrovaSyncLogger.d("Created offline document: \(tempId)")
+        return doc
+    }
+
+    func get(documentId: String) async throws -> SyncDocument? {
+        if isOfflineEnabled {
+            return try await getWithOfflineSupport(documentId: documentId)
+        }
+        return try await apiClient.getDocument(databaseId: databaseId, collectionId: id, documentId: documentId)
+    }
+
+    private func getWithOfflineSupport(documentId: String) async throws -> SyncDocument? {
+        // Ask the server unless we know we are offline; a failure falls back to the cached copy. With no cached copy
+        // the error is thrown: nil means the document does not exist, never "could not reach the server".
+        let isOnline = syncEngine?.isKnownOffline != true
+
+        // Check local cache first
+        let cached = localStorageManager?.getDocument(documentId: documentId)
+
+        // For local documents (not yet synced), always return from cache
+        if documentId.hasPrefix("local_") {
+            AbrovaSyncLogger.d("Returning local document from cache: \(documentId)")
+            return cached
+        }
+
+        if isOnline {
+            do {
+                let doc = try await apiClient.getDocument(databaseId: databaseId, collectionId: id, documentId: documentId)
+                if let doc = doc {
+                    // Update cache
+                    localStorageManager?.saveDocument(
+                        document: doc,
+                        databaseId: databaseId,
+                        collectionId: id,
+                        syncStatus: .synced
+                    )
+                }
+                return doc
+            } catch {
+                // The cache stands in only when the server could not answer; a refusal is the app's to see.
+                guard let cached = cached, SyncErrors.isTransient(error) else { throw error }
+                AbrovaSyncLogger.w("Failed to get document online, using cached: \(error)")
+                return cached
+            }
+        } else {
+            guard let cached = cached else {
+                throw AbrovaSyncError.networkError("Offline, and document '\(documentId)' is not in the local cache", nil)
+            }
+            return cached
+        }
+    }
+
+    func getAll() async throws -> [SyncDocument] {
+        if isOfflineEnabled {
+            return try await getAllWithOfflineSupport()
+        }
+        return try await apiClient.getAllDocuments(databaseId: databaseId, collectionId: id)
+    }
+
+    private func getAllWithOfflineSupport() async throws -> [SyncDocument] {
+        // Ask the server unless we know we are offline; a failure still falls
+        // back to the cache below.
+        let isOnline = syncEngine?.isKnownOffline != true
+
+        if isOnline {
+            do {
+                let snapshot = try await apiClient.fetchCollection(databaseId: databaseId, collectionId: id)
+                let docs = snapshot.documents
+                if snapshot.complete {
+                    // Also drops documents deleted on the server since last time.
+                    localStorageManager?.replaceSyncedDocuments(documents: docs, databaseId: databaseId, collectionId: id)
+                } else {
+                    // Could not confirm we saw everything: add and update only.
+                    localStorageManager?.saveDocuments(
+                        documents: docs,
+                        databaseId: databaseId,
+                        collectionId: id,
+                        syncStatus: .synced
+                    )
+                }
+                return docs
+            } catch {
+                // The cache stands in only when the server could not answer; a refusal (query_not_allowed) is thrown.
+                guard SyncErrors.isTransient(error) else { throw error }
+                AbrovaSyncLogger.w("Failed to get documents online, using cached: \(error)")
+                return localStorageManager?.getDocuments(databaseId: databaseId, collectionId: id) ?? []
+            }
+        } else {
+            return localStorageManager?.getDocuments(databaseId: databaseId, collectionId: id) ?? []
+        }
+    }
+
+    func update(documentId: String, data: [String: Any]) async throws -> SyncDocument {
+        if isOfflineEnabled {
+            return try await updateWithOfflineSupport(documentId: documentId, data: data)
+        }
+        return try await apiClient.updateDocument(databaseId: databaseId, collectionId: id, documentId: documentId, data: data)
+    }
+
+    private func updateWithOfflineSupport(documentId: String, data: [String: Any]) async throws -> SyncDocument {
+        // Write to the server unless the connection has reported offline - like reads. Before the first report
+        // (connect() not called yet, or still connecting) `isOnline` is false, which queued every write.
+        let isOnline = syncEngine?.isKnownOffline != true
+
+        // Get current version for conflict detection
+        let existing = localStorageManager?.getDocument(documentId: documentId)
+        let baseVersion = existing?.version ?? 1
+
+        if isOnline {
+            do {
+                let doc = try await apiClient.updateDocument(databaseId: databaseId, collectionId: id, documentId: documentId, data: data)
+                // Update cache
+                localStorageManager?.saveDocument(
+                    document: doc,
+                    databaseId: databaseId,
+                    collectionId: id,
+                    syncStatus: .synced
+                )
+                return doc
+            } catch {
+                guard SyncErrors.isTransient(error) else { throw error }
+                AbrovaSyncLogger.w("Failed to update document online, saving offline: \(error)")
+                return updateOfflineDocument(documentId: documentId, data: data, baseVersion: baseVersion)
+            }
+        } else {
+            return updateOfflineDocument(documentId: documentId, data: data, baseVersion: baseVersion)
+        }
+    }
+
+    private func updateOfflineDocument(documentId: String, data: [String: Any], baseVersion: Int) -> SyncDocument {
+        let existing = localStorageManager?.getDocument(documentId: documentId)
+        let now = Date().timeIntervalSince1970 * 1000
+
+        let doc = SyncDocument(
+            id: documentId,
+            data: data,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+            version: baseVersion + 1
+        )
+
+        localStorageManager?.saveDocument(
+            document: doc,
+            databaseId: databaseId,
+            collectionId: id,
+            syncStatus: .pendingUpdate,
+            baseVersion: baseVersion
+        )
+
+        AbrovaSyncLogger.d("Updated offline document: \(documentId)")
+        return doc
+    }
+
+    func set(documentId: String, data: [String: Any]) async throws -> SyncDocument {
+        try await set(documentId: documentId, data: data, merge: false)
+    }
+
+    func set(documentId: String, data: [String: Any], merge: Bool = false) async throws -> SyncDocument {
+        if isOfflineEnabled {
+            return try await setWithOfflineSupport(documentId: documentId, data: data, merge: merge)
+        }
+        return try await apiClient.setDocument(databaseId: databaseId, collectionId: id, documentId: documentId, data: data, merge: merge)
+    }
+
+    private func setWithOfflineSupport(documentId: String, data: [String: Any], merge: Bool) async throws -> SyncDocument {
+        // Write to the server unless the connection has reported offline - like reads. Before the first report
+        // (connect() not called yet, or still connecting) `isOnline` is false, which queued every write.
+        let isOnline = syncEngine?.isKnownOffline != true
+
+        if isOnline {
+            do {
+                let doc = try await apiClient.setDocument(databaseId: databaseId, collectionId: id, documentId: documentId, data: data, merge: merge)
+                localStorageManager?.saveDocument(
+                    document: doc,
+                    databaseId: databaseId,
+                    collectionId: id,
+                    syncStatus: .synced
+                )
+                return doc
+            } catch {
+                guard SyncErrors.isTransient(error) else { throw error }
+                AbrovaSyncLogger.w("Failed to set document online, saving offline: \(error)")
+                return setOfflineDocument(documentId: documentId, data: data, merge: merge)
+            }
+        } else {
+            return setOfflineDocument(documentId: documentId, data: data, merge: merge)
+        }
+    }
+
+    private func setOfflineDocument(documentId: String, data: [String: Any], merge: Bool) -> SyncDocument {
+        let existing = localStorageManager?.getDocument(documentId: documentId)
+        let now = Date().timeIntervalSince1970 * 1000
+        let isCreate = existing == nil
+
+        // The local copy shows what the server will hold once the queued set is sent.
+        var written = data
+        if merge, let existing = existing {
+            written = existing.data.mapValues { $0.value }
+            for (key, value) in data { written[key] = value }
+        }
+
+        let doc = SyncDocument(
+            id: documentId,
+            data: written,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+            version: (existing?.version ?? 0) + 1
+        )
+
+        localStorageManager?.saveDocument(
+            document: doc,
+            databaseId: databaseId,
+            collectionId: id,
+            syncStatus: isCreate ? .pendingCreate : .pendingUpdate,
+            baseVersion: existing?.version,
+            setMerge: merge
+        )
+
+        AbrovaSyncLogger.d("Set offline document: \(documentId) (\(isCreate ? "create" : "update"))")
+        return doc
+    }
+
+    func delete(documentId: String) async throws {
+        if isOfflineEnabled {
+            try await deleteWithOfflineSupport(documentId: documentId)
+            return
+        }
+        try await apiClient.deleteDocument(databaseId: databaseId, collectionId: id, documentId: documentId)
+    }
+
+    private func deleteWithOfflineSupport(documentId: String) async throws {
+        // Write to the server unless the connection has reported offline - like reads. Before the first report
+        // (connect() not called yet, or still connecting) `isOnline` is false, which queued every write.
+        let isOnline = syncEngine?.isKnownOffline != true
+
+        // Get current version for sync
+        let existing = localStorageManager?.getDocument(documentId: documentId)
+        let baseVersion = existing?.version ?? 1
+
+        if isOnline {
+            do {
+                try await apiClient.deleteDocument(databaseId: databaseId, collectionId: id, documentId: documentId)
+                // Remove from cache
+                localStorageManager?.deleteDocument(documentId: documentId)
+            } catch {
+                // Already gone on the server: deleted, as in Firestore.
+                if SyncErrors.httpStatus(error) == 404 {
+                    localStorageManager?.deleteDocument(documentId: documentId)
+                    return
+                }
+                guard SyncErrors.isTransient(error) else { throw error }
+                AbrovaSyncLogger.w("Failed to delete document online, marking for delete: \(error)")
+                // Mark for delete when back online
+                localStorageManager?.markPendingDelete(documentId: documentId, databaseId: databaseId, collectionId: id, baseVersion: baseVersion)
+            }
+        } else {
+            // Mark for delete when back online
+            localStorageManager?.markPendingDelete(documentId: documentId, databaseId: databaseId, collectionId: id, baseVersion: baseVersion)
+            AbrovaSyncLogger.d("Marked offline document for deletion: \(documentId)")
+        }
+    }
+    
+    // MARK: - Query Operations
+    
+    func query() -> SyncQuery {
+        return SyncQueryImpl(databaseId: databaseId, collectionId: id, apiClient: apiClient, mqttManager: mqttManager)
+    }
+    
+    func `where`(_ field: String, _ op: QueryOperator, _ value: Any?) -> SyncQuery {
+        return query().where(field, op, value)
+    }
+    
+    // MARK: - Realtime Listeners
+
+    func listen(callback: @escaping ([SyncDocument]) -> Void) -> ListenerRegistration {
+        listen(callback: callback, onError: { error in
+            AbrovaSyncLogger.e("Collection listener error", error: error)
+        })
+    }
+
+    func listen(callback: @escaping ([SyncDocument]) -> Void, onError: @escaping (Error) -> Void) -> ListenerRegistration {
+        let store = localStorageManager
+        let databaseId = self.databaseId, collectionId = id
+        let listener = ServerListener(
+            spec: ListenSpec(databaseId: databaseId, collectionId: collectionId, documentId: nil),
+            transport: apiClient,
+            topics: mqttManager,
+            onDocuments: callback,
+            onError: onError,
+            fallback: { [self] in self.topicListen(callback: callback, onError: onError) },
+            offlineSnapshot: store.map { store in { store.getDocuments(databaseId: databaseId, collectionId: collectionId) } },
+            cacheWriter: cacheWriter(),
+            completeSnapshot: { [apiClient] in
+                try await apiClient.fetchCollection(databaseId: databaseId, collectionId: collectionId).documents
+            }
+        )
+        return Self.run(listener, registry: mqttManager.serverListeners)
+    }
+
+    func listenDocument(documentId: String, callback: @escaping (SyncDocument?) -> Void) -> ListenerRegistration {
+        listenDocument(documentId: documentId, callback: callback, onError: { error in
+            AbrovaSyncLogger.e("Document listener error", error: error)
+        })
+    }
+
+    func listenDocument(documentId: String, callback: @escaping (SyncDocument?) -> Void, onError: @escaping (Error) -> Void) -> ListenerRegistration {
+        let store = localStorageManager
+        let listener = ServerListener(
+            spec: ListenSpec(databaseId: databaseId, collectionId: id, documentId: documentId),
+            transport: apiClient,
+            topics: mqttManager,
+            onDocument: callback,
+            onError: onError,
+            fallback: { [self] in self.topicListenDocument(documentId: documentId, callback: callback, onError: onError) },
+            offlineSnapshot: store.map { store in { store.getDocument(documentId: documentId).map { [$0] } } },
+            cacheWriter: cacheWriter()
+        )
+        return Self.run(listener, registry: mqttManager.serverListeners)
+    }
+
+    /// Starts a server-routed listener; removing the registration stops it.
+    static func run(_ listener: ServerListener, registry: ServerListenerRegistry) -> ListenerRegistration {
+        registry.add(listener)
+        listener.start()
+        return ListenerRegistrationImpl { [weak registry] in
+            listener.stop()
+            registry?.remove(listener)
+        }
+    }
+
+    /// With offline persistence, what listeners receive refreshes the local copy - never one with local changes
+    /// that are not sent yet.
+    private func cacheWriter() -> (([SyncDocument], [String]) -> Void)? {
+        guard let store = localStorageManager else { return nil }
+        let databaseId = self.databaseId, collectionId = id
+        return { saved, removed in
+            store.applyServerChanges(saved: saved, removed: removed, databaseId: databaseId, collectionId: collectionId)
+        }
+    }
+
+    // MARK: - Topic listening (Sync APIs without server-routed listeners)
+
+    func topicListen(callback: @escaping ([SyncDocument]) -> Void, onError: @escaping (Error) -> Void) -> ListenerRegistration {
+        let topic = mqttManager.collectionTopic(databaseId: databaseId, collectionId: id)
+
+        // Initial fetch
+        Task {
+            do {
+                let documents = try await getAll()
+                DispatchQueue.main.async {
+                    callback(documents)
+                }
+            } catch {
+                AbrovaSyncLogger.e("Failed to fetch initial documents", error: error)
+                DispatchQueue.main.async { onError(error) }
+            }
+        }
+
+        // Subscribe to MQTT changes
+        // Note: We capture self strongly here because the collection instance needs to stay alive
+        // for the lifetime of the subscription. The ListenerRegistration will unsubscribe when removed.
+        let handle = mqttManager.subscribe(topic: topic) { [self] _ in
+            Task {
+                do {
+                    let documents = try await self.getAll()
+                    DispatchQueue.main.async {
+                        callback(documents)
+                    }
+                } catch {
+                    AbrovaSyncLogger.e("Failed to refetch documents after change", error: error)
+                }
+            }
+        }
+
+        return ListenerRegistrationImpl { [mqttManager, handle] in
+            mqttManager.unsubscribe(handle: handle)
+        }
+    }
+
+    func topicListenDocument(documentId: String, callback: @escaping (SyncDocument?) -> Void, onError: @escaping (Error) -> Void) -> ListenerRegistration {
+        // The document's own topic: the collection topic would deliver (and bill) every change in the collection.
+        let topic = mqttManager.documentTopic(databaseId: databaseId, collectionId: id, documentId: documentId)
+        AbrovaSyncLogger.i("listenDocument: Subscribing to document MQTT topic: \(topic)")
+
+        // Initial fetch
+        Task {
+            do {
+                let document = try await get(documentId: documentId)
+                DispatchQueue.main.async {
+                    callback(document)
+                }
+            } catch {
+                AbrovaSyncLogger.e("Failed to fetch initial document", error: error)
+                DispatchQueue.main.async { onError(error) }
+            }
+        }
+
+        let handle = mqttManager.subscribe(topic: topic) { [self] payload in
+            guard let data = payload.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                AbrovaSyncLogger.e("listenDocument: Failed to parse MQTT payload", error: nil)
+                return
+            }
+
+            // Only messages for our document.
+            guard let msgDocId = json["documentId"] as? String, msgDocId == documentId else {
+                return
+            }
+
+            let eventType = json["type"] as? String ?? "update"
+            AbrovaSyncLogger.i("listenDocument: Received change for documentId=\(documentId), type=\(eventType)")
+
+            // Handle delete
+            if eventType == "delete" {
+                DispatchQueue.main.async {
+                    callback(nil)
+                }
+                return
+            }
+
+            // Use data directly from MQTT message if available
+            if let docData = json["data"] as? [String: Any] {
+                let now = Date().timeIntervalSince1970 * 1000
+
+                // Parse timestamp from ISO string if available
+                var updatedAt = now
+                if let timestampStr = json["timestamp"] as? String {
+                    let formatter = ISO8601DateFormatter()
+                    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    if let date = formatter.date(from: timestampStr) {
+                        updatedAt = date.timeIntervalSince1970 * 1000
+                    }
+                }
+
+                let createdAt = (json["createdAt"] as? Double) ?? (json["createdAt"] as? Int).map { Double($0) } ?? updatedAt
+                let docUpdatedAt = (json["updatedAt"] as? Double) ?? (json["updatedAt"] as? Int).map { Double($0) } ?? updatedAt
+                let version = json["version"] as? Int ?? 1
+
+                let doc = SyncDocument(
+                    id: msgDocId,
+                    data: docData,
+                    createdAt: createdAt,
+                    updatedAt: docUpdatedAt,
+                    version: version
+                )
+                DispatchQueue.main.async {
+                    callback(doc)
+                }
+            } else {
+                // Fallback to refetch if no data in message
+                Task {
+                    do {
+                        let document = try await self.get(documentId: documentId)
+                        DispatchQueue.main.async {
+                            callback(document)
+                        }
+                    } catch {
+                        AbrovaSyncLogger.e("Failed to refetch document after change", error: error)
+                    }
+                }
+            }
+        }
+
+        return ListenerRegistrationImpl { [mqttManager, handle] in
+            mqttManager.unsubscribe(handle: handle)
+        }
+    }
+}
+
+/// Implementation of ListenerRegistration
+internal class ListenerRegistrationImpl: ListenerRegistration {
+    private let onRemove: () -> Void
+    
+    init(onRemove: @escaping () -> Void) {
+        self.onRemove = onRemove
+    }
+    
+    func remove() {
+        onRemove()
+    }
+}
+
+/// Implementation of SyncQuery
+internal class SyncQueryImpl: SyncQuery {
+    private let databaseId: String
+    private let collectionId: String
+    private let apiClient: ApiClient
+    private let mqttManager: MqttManager
+    private var params = QueryParams()
+    
+    init(databaseId: String, collectionId: String, apiClient: ApiClient, mqttManager: MqttManager) {
+        self.databaseId = databaseId
+        self.collectionId = collectionId
+        self.apiClient = apiClient
+        self.mqttManager = mqttManager
+    }
+    
+    func `where`(_ field: String, _ op: QueryOperator, _ value: Any?) -> SyncQuery {
+        params.filters.append([
+            "field": field,
+            "operator": op.rawValue,
+            "value": value ?? NSNull()
+        ])
+        return self
+    }
+    
+    func orderBy(_ field: String, direction: OrderDirection = .ascending) -> SyncQuery {
+        params.orderByField = field
+        params.orderDirection = direction.rawValue
+        return self
+    }
+    
+    func limit(_ count: Int) -> SyncQuery {
+        params.limitCount = count
+        return self
+    }
+    
+    func offset(_ count: Int) -> SyncQuery {
+        params.offsetCount = count
+        return self
+    }
+    
+    func get() async throws -> [SyncDocument] {
+        return try await apiClient.queryDocuments(databaseId: databaseId, collectionId: collectionId, query: params)
+    }
+    
+    func get(onSuccess: @escaping ([SyncDocument]) -> Void, onError: @escaping (Error) -> Void) {
+        Task {
+            do {
+                let docs = try await get()
+                DispatchQueue.main.async {
+                    onSuccess(docs)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    onError(error)
+                }
+            }
+        }
+    }
+    
+    func listen(callback: @escaping ([SyncDocument]) -> Void) -> ListenerRegistration {
+        listen(callback: callback, onError: { error in
+            AbrovaSyncLogger.e("Query listener error", error: error)
+        })
+    }
+
+    /// What this query listens to.
+    var listenSpec: ListenSpec {
+        ListenSpec(
+            databaseId: databaseId, collectionId: collectionId, documentId: nil,
+            filters: params.filters, orderByField: params.orderByField, orderDirection: params.orderDirection,
+            limit: params.limitCount, offset: params.offsetCount
+        )
+    }
+
+    func listen(callback: @escaping ([SyncDocument]) -> Void, onError: @escaping (Error) -> Void) -> ListenerRegistration {
+        let listener = ServerListener(
+            spec: listenSpec,
+            transport: apiClient,
+            topics: mqttManager,
+            onDocuments: callback,
+            onError: onError,
+            fallback: { [self] in self.topicListen(callback: callback, onError: onError) }
+        )
+        return SyncCollectionImpl.run(listener, registry: mqttManager.serverListeners)
+    }
+
+    /// Topic listening, for Sync APIs without server-routed listeners: the query runs again on every change.
+    func topicListen(callback: @escaping ([SyncDocument]) -> Void, onError: @escaping (Error) -> Void) -> ListenerRegistration {
+        let topic = mqttManager.collectionTopic(databaseId: databaseId, collectionId: collectionId)
+
+        // Initial fetch with query
+        Task {
+            do {
+                let documents = try await get()
+                DispatchQueue.main.async {
+                    callback(documents)
+                }
+            } catch {
+                AbrovaSyncLogger.e("Failed to fetch initial query results", error: error)
+                DispatchQueue.main.async { onError(error) }
+            }
+        }
+
+        // Subscribe to MQTT changes and re-run query
+        // Note: We capture self strongly here because the query instance needs to stay alive
+        // for the lifetime of the subscription. The ListenerRegistration will unsubscribe when removed.
+        let handle = mqttManager.subscribe(topic: topic) { [self] _ in
+            Task {
+                do {
+                    let documents = try await self.get()
+                    DispatchQueue.main.async {
+                        callback(documents)
+                    }
+                } catch {
+                    AbrovaSyncLogger.e("Failed to refetch query results after change", error: error)
+                }
+            }
+        }
+
+        return ListenerRegistrationImpl { [mqttManager, handle] in
+            mqttManager.unsubscribe(handle: handle)
+        }
+    }
+}

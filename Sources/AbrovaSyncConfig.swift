@@ -1,0 +1,276 @@
+import Foundation
+
+/// Configuration for AbrovaSync SDK
+public struct AbrovaSyncConfig {
+    /// Your AbrovaSync API key from Abrova Console (ab_live_xxx)
+    public let apiKey: String
+    /// Optional user/device identifier for Security Rules (used as auth.uid).
+    /// If not provided, the SDK auto-generates a stable device ID.
+    public let userId: String?
+    /// Signed user token, if the app already holds one at init.
+    public let userToken: String?
+    /// Abrova's endpoints, fixed in the SDK: HTTPS for the API, MQTT over TLS for realtime. Apps can't change them,
+    /// so nothing is ever sent unencrypted. The Sync API may move realtime to another encrypted abrova.ir endpoint
+    /// (see MqttEndpoint).
+    internal private(set) var apiUrl: String
+    internal private(set) var mqttHost: String
+    internal private(set) var mqttPort: Int
+    internal private(set) var mqttUseTls: Bool
+    /// Set by `AbrovaSyncConfigBuilder.useEmulator`: a local Abrova Sync server instead of Abrova's.
+    internal private(set) var emulatorHost: String?
+    public let debugMode: Bool
+    public let autoReconnect: Bool
+    public let reconnectInterval: TimeInterval
+    public let connectionTimeout: Int
+    public let keepAliveInterval: Int
+
+    // Offline persistence options
+    public let offlineEnabled: Bool
+    public let offlineCacheSizeMb: Int
+    public let syncOnReconnect: Bool
+    public let conflictStrategy: ConflictStrategy
+    public let conflictResolver: ConflictResolver?
+    public let maxSyncRetries: Int
+
+    /// Name of the official wrapper SDK (e.g. "flutter", "react-native") that
+    /// embeds this native SDK; reported in the `X-Abrova-SDK` header together
+    /// with `wrapperSdkVersion`. For Abrova's own wrappers only - apps leave it
+    /// nil. Both must be <=32 chars of `[A-Za-z0-9._+-]` or they are ignored.
+    public let wrapperSdkName: String?
+    /// Version of the official wrapper SDK. See `wrapperSdkName`.
+    public let wrapperSdkVersion: String?
+
+    private static let defaultApiUrl = "https://sync.abrova.ir"
+    private static let defaultMqttHost = "mqtt-sync.abrova.ir"
+    private static let defaultMqttPort = 8885
+    private static let defaultMqttUseTls = true
+    /// A local Abrova Sync server's API port and realtime port (`useEmulator`).
+    internal static let defaultEmulatorPort = 3006
+    internal static let defaultEmulatorMqttPort = 1884
+    private static let defaultOfflineCacheSizeMb = 100
+    private static let defaultMaxSyncRetries = 3
+
+    public init(
+        apiKey: String,
+        userId: String? = nil,
+        userToken: String? = nil,
+        debugMode: Bool = false,
+        autoReconnect: Bool = true,
+        reconnectInterval: TimeInterval = 5.0,
+        connectionTimeout: Int = 30,
+        keepAliveInterval: Int = 60,
+        offlineEnabled: Bool = false,
+        offlineCacheSizeMb: Int? = nil,
+        syncOnReconnect: Bool = true,
+        conflictStrategy: ConflictStrategy = .serverWins,
+        conflictResolver: ConflictResolver? = nil,
+        maxSyncRetries: Int? = nil,
+        wrapperSdkName: String? = nil,
+        wrapperSdkVersion: String? = nil
+    ) {
+        precondition(!apiKey.isEmpty, "API key cannot be empty")
+
+        self.apiKey = apiKey
+        self.userId = userId
+        self.userToken = userToken
+        self.apiUrl = Self.defaultApiUrl
+        self.mqttHost = Self.defaultMqttHost
+        self.mqttPort = Self.defaultMqttPort
+        self.mqttUseTls = Self.defaultMqttUseTls
+        self.debugMode = debugMode
+        self.autoReconnect = autoReconnect
+        self.reconnectInterval = reconnectInterval
+        self.connectionTimeout = connectionTimeout
+        self.keepAliveInterval = keepAliveInterval
+        self.offlineEnabled = offlineEnabled
+        self.offlineCacheSizeMb = offlineCacheSizeMb ?? Self.defaultOfflineCacheSizeMb
+        self.syncOnReconnect = syncOnReconnect
+        self.conflictStrategy = conflictStrategy
+        self.conflictResolver = conflictResolver
+        self.maxSyncRetries = maxSyncRetries ?? Self.defaultMaxSyncRetries
+        self.wrapperSdkName = wrapperSdkName
+        self.wrapperSdkVersion = wrapperSdkVersion
+    }
+
+    /// Point this config at a local server: the API over plain HTTP at `host:port`, realtime on the same host
+    /// without TLS. See `AbrovaSyncConfigBuilder.useEmulator`.
+    internal mutating func useEmulator(host: String, port: Int) {
+        emulatorHost = host
+        apiUrl = "http://\(host):\(port)"
+        mqttHost = host
+        mqttPort = Self.defaultEmulatorMqttPort
+        mqttUseTls = false
+    }
+
+    /// Value of the `X-Abrova-SDK` header: `ios/<version>`, or the wrapper's
+    /// identity first with this native SDK underneath.
+    internal var sdkHeaderValue: String {
+        return AbrovaSyncSDKInfo.headerValue(wrapperName: wrapperSdkName, wrapperVersion: wrapperSdkVersion)
+    }
+
+    internal var mqttServerUri: String {
+        let scheme = mqttUseTls ? "mqtts" : "mqtt"
+        return "\(scheme)://\(mqttHost):\(mqttPort)"
+    }
+}
+
+/// Builder for AbrovaSyncConfig
+public class AbrovaSyncConfigBuilder {
+    /// Your AbrovaSync API key from Abrova Console (ab_live_xxx)
+    private let apiKey: String
+    private var userId: String?
+    private var userToken: String?
+    private var debugMode: Bool = false
+    private var autoReconnect: Bool = true
+    private var reconnectInterval: TimeInterval = 5.0
+    private var connectionTimeout: Int = 30
+    private var keepAliveInterval: Int = 60
+    private var offlineEnabled: Bool = false
+    private var offlineCacheSizeMb: Int?
+    private var syncOnReconnect: Bool = true
+    private var conflictStrategy: ConflictStrategy = .serverWins
+    private var conflictResolver: ConflictResolver?
+    private var maxSyncRetries: Int?
+    private var wrapperSdkName: String?
+    private var wrapperSdkVersion: String?
+    private var emulatorHost: String?
+    private var emulatorPort: Int = AbrovaSyncConfig.defaultEmulatorPort
+
+    public init(apiKey: String) {
+        self.apiKey = apiKey
+    }
+
+    /// Set user/device identifier for Security Rules (used as auth.uid).
+    /// If not set, the SDK auto-generates a stable device ID.
+    ///
+    /// The server cannot trust this: anyone who unpacks your app can change it,
+    /// and a project that enforces `requireSignedTokens` refuses it. Prefer
+    /// `userToken(_:)` or `AbrovaSync.userTokens`.
+    public func userId(_ userId: String) -> Self {
+        self.userId = userId
+        return self
+    }
+
+    /// A signed user token minted by YOUR backend with its server secret
+    /// (`POST /users/token`). This is what makes `auth.uid` trustworthy.
+    ///
+    /// Set `AbrovaSync.userTokens.provider` instead if you want the SDK to
+    /// refresh it by itself.
+    public func userToken(_ token: String) -> Self {
+        self.userToken = token
+        return self
+    }
+
+
+
+
+
+    public func debugMode(_ debug: Bool) -> Self {
+        self.debugMode = debug
+        return self
+    }
+
+    public func autoReconnect(_ autoReconnect: Bool) -> Self {
+        self.autoReconnect = autoReconnect
+        return self
+    }
+
+    public func reconnectInterval(_ interval: TimeInterval) -> Self {
+        self.reconnectInterval = interval
+        return self
+    }
+
+    public func connectionTimeout(_ timeout: Int) -> Self {
+        self.connectionTimeout = timeout
+        return self
+    }
+
+    public func keepAliveInterval(_ interval: Int) -> Self {
+        self.keepAliveInterval = interval
+        return self
+    }
+
+    /// Enable offline persistence
+    public func offlineEnabled(_ enabled: Bool) -> Self {
+        self.offlineEnabled = enabled
+        return self
+    }
+
+    /// Set the maximum cache size in megabytes
+    public func offlineCacheSizeMb(_ sizeMb: Int) -> Self {
+        self.offlineCacheSizeMb = sizeMb
+        return self
+    }
+
+    /// Automatically sync pending operations when connection is restored
+    public func syncOnReconnect(_ sync: Bool) -> Self {
+        self.syncOnReconnect = sync
+        return self
+    }
+
+    /// Set the conflict resolution strategy
+    public func conflictStrategy(_ strategy: ConflictStrategy) -> Self {
+        self.conflictStrategy = strategy
+        return self
+    }
+
+    /// Set a custom conflict resolver for manual conflict strategy
+    public func conflictResolver(_ resolver: ConflictResolver) -> Self {
+        self.conflictResolver = resolver
+        return self
+    }
+
+    /// No longer limits anything: as in Firestore, a write that could not be sent (no network, server error) is
+    /// retried until it goes through, and one the server refuses is rolled back
+    /// (`SyncEngine.SyncListener.onDocumentRejected`). Kept so existing code compiles.
+    @available(*, deprecated, message: "Writes are retried until they go through; refused ones are rolled back. This has no effect.")
+    public func maxSyncRetries(_ retries: Int) -> Self {
+        self.maxSyncRetries = retries
+        return self
+    }
+
+    /// For Abrova's own SDK tests; apps don't use this.
+    public func useEmulator(host: String, port: Int = 3006) -> Self {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        precondition(!trimmed.isEmpty && !trimmed.contains("/") && !trimmed.contains(":"),
+                     "host is a host name or IP address, without scheme or port")
+        precondition((1...65535).contains(port), "port must be 1-65535")
+        self.emulatorHost = trimmed
+        self.emulatorPort = port
+        return self
+    }
+
+    /// For Abrova's official wrapper SDKs (Flutter, React Native) only: the
+    /// wrapper's name and version, reported in the `X-Abrova-SDK` header.
+    /// Apps should not call this.
+    public func wrapperSdk(name: String?, version: String?) -> Self {
+        self.wrapperSdkName = name
+        self.wrapperSdkVersion = version
+        return self
+    }
+
+    public func build() -> AbrovaSyncConfig {
+        var config = AbrovaSyncConfig(
+            apiKey: apiKey,
+            userId: userId,
+            userToken: userToken,
+            debugMode: debugMode,
+            autoReconnect: autoReconnect,
+            reconnectInterval: reconnectInterval,
+            connectionTimeout: connectionTimeout,
+            keepAliveInterval: keepAliveInterval,
+            offlineEnabled: offlineEnabled,
+            offlineCacheSizeMb: offlineCacheSizeMb,
+            syncOnReconnect: syncOnReconnect,
+            conflictStrategy: conflictStrategy,
+            conflictResolver: conflictResolver,
+            maxSyncRetries: maxSyncRetries,
+            wrapperSdkName: wrapperSdkName,
+            wrapperSdkVersion: wrapperSdkVersion
+        )
+        if let host = emulatorHost {
+            config.useEmulator(host: host, port: emulatorPort)
+        }
+        return config
+    }
+}

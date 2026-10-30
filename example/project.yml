@@ -1,0 +1,58 @@
+name: AbrovaSyncExample
+options:
+  bundleIdPrefix: ir.abrova.sync
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+packages:
+  AbrovaSync:
+    url: https://center.abrova.ir/abrova/abrova-sync-ios-sdk.git
+    from: "0.3.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+  configs:
+    Debug:
+      DEBUG_INFORMATION_FORMAT: "dwarf-with-dsym"
+    Release:
+      DEBUG_INFORMATION_FORMAT: "dwarf-with-dsym"
+
+targets:
+  AbrovaSyncExample:
+    type: application
+    platform: iOS
+    sources:
+      - path: AbrovaSyncExample
+        excludes:
+          - "Local*.plist"
+    # Local.plist (not checked in, see Config.swift) is copied only when it exists, so the example builds without it.
+    postCompileScripts:
+      - name: Copy Local.plist
+        script: |
+          [ -f "$SRCROOT/AbrovaSyncExample/Local.plist" ] && cp "$SRCROOT/AbrovaSyncExample/Local.plist" "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/Local.plist" || true
+    settings:
+      base:
+        INFOPLIST_FILE: AbrovaSyncExample/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: ir.abrova.sync.example
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: false
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+    dependencies:
+      - package: AbrovaSync
+        product: AbrovaSync
+    scheme:
+      testTargets: []
+      gatherCoverageData: false
+      commandLineArguments: {}
+      environmentVariables: {}
