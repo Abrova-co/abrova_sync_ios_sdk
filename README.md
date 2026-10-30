@@ -41,11 +41,13 @@ Then add the library to your target's dependencies:
 
 ### CocoaPods
 
-Add to your `Podfile` (`PNProtocol` is the SDK's protocol library, also published on Abrova Center):
+Add Abrova Center's spec repository at the top of your `Podfile` (the second `source` line keeps public pods working), then the pod:
 
 ```ruby
-pod 'PNProtocol', :git => 'https://center.abrova.ir/abrova/pn-protocol-ios.git'
-pod 'AbrovaSync', :git => 'https://center.abrova.ir/abrova/abrova-sync-ios-sdk.git', :tag => '0.3.0'
+source 'https://center.abrova.ir/abrova/specs.git'
+source 'https://cdn.cocoapods.org/'
+
+pod 'AbrovaSync', '~> 0.3'
 ```
 
 Then run:

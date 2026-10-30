@@ -13,7 +13,7 @@ Pod::Spec.new do |s|
 
   s.source_files = 'Sources/**/*.swift'
 
-  s.dependency 'PNProtocol', '~> 0.2'
+  s.dependency 'AbrovaPNProtocol', '~> 0.2'
 
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
 end
