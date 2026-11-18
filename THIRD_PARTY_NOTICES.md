@@ -30,7 +30,7 @@ TCP and TLS sockets under CocoaMQTT.
 ## Starscream (via CocoaMQTT, Swift Package Manager only)
 
 WebSocket support that Swift Package Manager resolves with CocoaMQTT. The SDK
-connects over MQTT/TCP and does not use it; CocoaPods does not install it.
+connects over TCP and does not use it; CocoaPods does not install it.
 
 - Homepage: https://github.com/daltoniam/Starscream
 - Version: 4.0.8
